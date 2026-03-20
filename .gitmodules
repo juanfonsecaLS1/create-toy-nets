@@ -2,3 +2,7 @@
 	path = UrbanToyGraph
 	url = https://github.com/csebastiao/UrbanToyGraph.git
 	branch = main
+[submodule "spatial-centrality-pub"]
+	path = spatial-centrality-pub
+	url = https://github.com/juanfonsecaLS1/spatial-centrality-pub.git
+	branch = main
