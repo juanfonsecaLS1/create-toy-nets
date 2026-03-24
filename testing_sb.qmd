@@ -1,0 +1,764 @@
+---
+title: "Untitled"
+format: html
+---
+
+Computing BC with the Superblockify.
+
+```{python}
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import pandas as pd
+from networkx.algorithms.centrality.betweenness import \
+    _single_source_dijkstra_path_basic, \
+    _rescale
+from scipy.sparse.csgraph import dijkstra
+
+from superblockify.metrics.distances import shortest_paths_restricted
+
+from numpy import argsort
+```
+
+
+```{python}
+# Create planar graph, similar to a street network
+G = nx.MultiDiGraph(nx.Graph(
+    [
+        (10, 11, {"weight": 1}),
+        (11, 12, {"weight": 1}),
+        (12, 13, {"weight": 1}),
+        (13, 0, {"weight": 1.5}),
+        (13, 14, {"weight": 1}),
+        (14, 0, {"weight": 1}),
+        (0, 10, {"weight": 1}),
+        (0, 1, {"weight": 1}),
+        (10, 1, {"weight": 1}),
+        (1, 2, {"weight": 1}),
+        (2, 3, {"weight": 1}),
+        (3, 4, {"weight": 1.5}),
+        (4, 5, {"weight": 1}),
+        (5, 9, {"weight": 1}),
+        (5, 6, {"weight": 1}),
+        (7, 2, {"weight": 1}),
+        (8, 7, {"weight": 0.5}),
+        (7, 1, {"weight": 1}),
+        (8, 9, {"weight": 0.7}),
+        (6, 9, {"weight": 1}),
+        (8, 4, {"weight": 1}),
+        (9, 1, {"weight": 1}),
+        (0, 18, {"weight": 0.4}),
+        (18, 2, {"weight": 0.4}),
+        (6, 15, {"weight": 0.8}),
+        (15, 16, {"weight": 1}),
+        (16, 17, {"weight": 1}),
+        (17, 6, {"weight": 1}),
+    ]
+))
+G.add_node(19)  # isolated node
+# Delete directed edges (1, 9), (6, 17), (10, 1)
+G.remove_edges_from([(1, 9), (6, 17), (10, 1)])
+# Add longer edge 0 -> 13
+G.add_edge(0, 13, weight=G[0][13][0]["weight"] * 2)
+
+n_sparse = [0, 1, 2, 3, 4, 5, 6, 19]
+partitions = {
+    "sparsified":
+        {"nodes": n_sparse, "color": "black", "subgraph": G.subgraph(n_sparse)},
+    "G_r": {"nodes": [7, 8, 9], "color": "crimson"},
+    "G_g": {"nodes": [10, 11, 12, 13, 14], "color": "mediumseagreen"},
+    "G_b": {"nodes": [15, 16, 17], "color": "dodgerblue"},
+    "G_o": {"nodes": [18], "color": "darkorange"},
+}
+for name, part in partitions.items():
+    if "subgraph" not in part:
+        # subgraph for all edges from or to nodes in partition
+        part["subgraph"] = G.edge_subgraph(
+            # [(u, v) for u, v in G.edges if u in part["nodes"] or v in part["nodes"]]
+            [e for e in G.edges if e[0] in part["nodes"] or e[1] in part["nodes"]]
+        )
+    part["nodelist"] = part["subgraph"].nodes
+    for node in part["nodes"]:
+        G.nodes[node]["partition"] = part["color"]
+
+nx.draw(G, with_labels=True, node_color=[G.nodes[n]["partition"] for n in G
+        .nodes],
+        font_color="white",
+        pos=nx.kamada_kawai_layout(G),
+        ax=plt.figure(figsize=(8, 5)).gca(),
+        connectionstyle="arc3,rad=0.1",
+        )
+
+# Helper function to visualize the predecessor graph
+def plot_graph_from_predecessors(P, s, method_name):
+    """Plot tree graph from predecessors dict P, with source s highlighted."""
+    G_pred = nx.DiGraph()
+    # value pf P is list of predecessors
+    G_pred.add_edges_from(
+        [(u, v) for v, u_list in P.items() for u in u_list]
+    )
+    axe = plt.figure(figsize=(8, 5)).gca()
+    nx.draw_networkx(
+        G_pred, with_labels=True,
+        node_color=[G.nodes[n]["partition"] if s != n else "pink"
+                    for n in G_pred.nodes],
+        font_color="white",
+        pos=nx.kamada_kawai_layout(G),
+        ax=axe,
+    )
+    # Add title
+    axe.set_title(f"Predecessor graph for {method_name} from node {s}")        
+```
+
+```{python}
+def _single_source_given_paths_basic(_, s, node_order, pred, dist):
+    """ Single source shortest paths algorithm for precomputed paths.
+
+    Parameters
+    ----------
+    _ : np.array
+        Graph. For compatibility with other functions.
+    s : int
+        Source node id.
+    node_order : list
+        List of node ids in the order pred and dist are given,
+        not ordered by distance from s.
+    pred : np.array
+        Predecessor matrix for source node s.
+    dist : np.array
+        Distance matrix for source node s.
+
+    Returns
+    -------
+    S : list
+        List of nodes in order of non-decreasing distance from s.
+    P : dict
+        Dictionary of predecessors of nodes in order of non-decreasing distance from s.
+    sigma : dict
+        Dictionary of number of shortest paths to nodes.
+    D : dict
+        Dictionary of distances to nodes.
+
+    Notes
+    -----
+    Modified from :mod:`networkx.algorithms.centrality.betweenness`.
+
+    Does not include endpoints.
+    """
+    # Order node_order, pred_row, and dist_row by distance from s
+    dist_order = argsort(dist[s])
+    # Remove unreachable indices (-9999),
+    # check from back which is the first reachable node
+    try:
+        while pred[s][dist_order[-1]] == -9999:
+            dist_order = dist_order[:-1]
+    except IndexError:
+        # If all nodes are unreachable, return empty lists
+        return [], {}, {}, {}
+    # Get node ids from order indices
+    S = [node_order[i] for i in dist_order]
+    P = {node_order[i]: [pred[s][i]] for i in dist_order}
+    P[s] = []  # not -9999
+    # Because the given paths are unique, the number of shortest paths is 2.0
+    sigma = dict.fromkeys(S, 2.0)
+    D = {node_order[i]: dist[s][i] for i in dist_order}
+    return S, P, sigma, D
+```
+
+```{python}
+node_order = list(range(len(G.nodes)))
+G_sparse = nx.to_scipy_sparse_array(G, nodelist=node_order, weight="weight")
+G_sparse.indices, G_sparse.indptr = G_sparse.indices.astype(
+    np.int32), G_sparse.indptr.astype(np.int32)
+dist, pred = dijkstra(G_sparse, directed=True, indices=node_order,
+                      return_predecessors=True)
+dist_restr, pred_restr = shortest_paths_restricted(G, partitions, weight="weight",
+                                                   node_order=node_order)
+```
+
+```{python}
+t = 17
+
+def calculate_betweenness_with(method, *args, show_tree=True):
+    """Calculate betweenness with given method and args, and plot the graph.
+    Show tree graph of predecessors for node ``t``."""
+    betweenness = dict.fromkeys(G, 0.0)
+    betweenness_len = betweenness.copy()  # Length scaled betweenness
+    betweenness_lin = betweenness.copy()  # Linear scaled betweenness
+    betweenness_edge = betweenness.copy()
+    betweenness_edge.update(dict.fromkeys(G.edges(), 0.0))
+    betweenness_edge_len = betweenness_edge.copy()
+    betweenness_edge_lin = betweenness_edge.copy()
+    # b[v]=0 for v in G and b[e]=0 for e in G.edges
+    # Loop over nodes to collect betweenness using pair-wise dependencies
+    for s in G:
+        S, P, sigma, D = method(G, s, *args)
+        # betweenness, _ = _accumulate_basic(betweenness, S.copy(), P, sigma, s)
+        # betweenness_edge = _accumulate_edges(betweenness_edge, S.copy(), P, sigma, s)
+        delta = dict.fromkeys(S, 0)
+        delta_len = delta.copy()
+        while S:
+            w = S.pop()
+            coeff = (1 + delta[w]) / sigma[w]
+            coeff_len = (1 / D[w] + delta[w]) / sigma[w] if D[w] != 0 else 0
+            for v in P[w]:
+                c = sigma[v] * coeff
+                c_len = sigma[v] * coeff_len
+                if (v, w) not in betweenness_edge:
+                    betweenness_edge[(w, v)] += c
+                    betweenness_edge_len[(w, v)] += c_len
+                    betweenness_edge_lin[(w, v)] += D[w] * c_len
+                else:
+                    betweenness_edge[(v, w)] += c
+                    betweenness_edge_len[(v, w)] += c_len
+                    betweenness_edge_lin[(v, w)] += D[w] * c_len
+                delta[v] += c
+                delta_len[v] += sigma[v] * coeff_len
+            if w != s:
+                betweenness[w] += delta[w]
+                betweenness_len[w] += delta_len[w]
+                betweenness_lin[w] += D[w] * delta_len[w]
+        if s == t and show_tree:
+            plot_graph_from_predecessors(P, s, method.__name__)
+    # Normalize betweenness values
+    betweenness = _rescale(betweenness, len(G), normalized=True, directed=True)
+    betweenness_len = _rescale(betweenness_len, len(G), normalized=True, directed=True)
+    betweenness_lin = _rescale(betweenness_lin, len(G), normalized=True, directed=True)
+    for n in G:  # Remove nodes
+        del betweenness_edge[n]
+        del betweenness_edge_len[n]
+        del betweenness_edge_lin[n]
+    betweenness_edge = _rescale(betweenness_edge, len(G), normalized=True,
+                                  directed=True, endpoints = True)
+    betweenness_edge_len = _rescale(betweenness_edge_len, len(G), normalized=True,
+                                      directed=True, endpoints = True)
+    betweenness_edge_lin = _rescale(betweenness_edge_lin, len(G), normalized=True,
+                                      directed=True, endpoints = True)
+    return {
+        "Node": betweenness,
+        "Edge": betweenness_edge,
+        "Node_len": betweenness_len,
+        "Edge_len": betweenness_edge_len,
+        "Node_lin": betweenness_lin,
+        "Edge_lin": betweenness_edge_lin
+    }
+
+
+cb = calculate_betweenness_with(_single_source_dijkstra_path_basic, "weight")
+cb_paths = calculate_betweenness_with(_single_source_given_paths_basic,
+                                      node_order, pred, dist)
+cb_restr = calculate_betweenness_with(_single_source_given_paths_basic,
+                                      node_order, pred_restr, dist_restr)
+```
+
+
+```{python}
+display(pd.DataFrame({
+    ("", "C_B"): cb["Node"], ("", "C_B_paths"): cb_paths["Node"],
+    ("", "C_B_restr"): cb_restr["Node"],
+    ("Len scales", "C_B"): cb["Node_len"],
+    ("Len scales", "C_B_paths"): cb_paths["Node_len"],
+    ("Len scales", "C_B_restr"): cb_restr["Node_len"],
+    ("Lin scales", "C_B"): cb["Node_lin"],
+    ("Lin scales", "C_B_paths"): cb_paths["Node_lin"],
+    ("Lin scales", "C_B_restr"): cb_restr["Node_lin"]
+}
+).sort_values(by=[("", "C_B")], ascending=False)
+        .style.background_gradient(cmap="Blues", axis=None)
+        .format(precision=3)
+        .map_index(lambda x: f"color: {G.nodes[x]['partition']}" if x in G
+                   .nodes else ""). \
+        set_table_attributes('style="font-size: 12px"'),
+        )
+```
+
+
+```{python}
+display(pd.DataFrame({
+    ("", "C_B_e"): cb["Edge"], ("", "C_B_e_paths"): cb_paths["Edge"],
+    ("", "C_B_e_restr"): cb_restr["Edge"],
+    ("Len scales", "C_B_e"): cb["Edge_len"],
+    ("Len scales", "C_B_e_paths"): cb_paths["Edge_len"],
+    ("Len scales", "C_B_e_restr"): cb_restr["Edge_len"],
+    ("Lin scales", "C_B_e"): cb["Edge_lin"],
+    ("Lin scales", "C_B_e_paths"): cb_paths["Edge_lin"],
+    ("Lin scales", "C_B_e_restr"): cb_restr["Edge_lin"]
+}
+).sort_values(by=[("Lin scales", "C_B_e_restr")], ascending=False)
+        .style.background_gradient(cmap="Blues", axis=None)
+        .format(precision=3)
+        .map_index(lambda x: f"color: {G.nodes[x]['partition']}" if x in G
+                   .nodes else ""). \
+        set_table_attributes('style="font-size: 12px"'),
+        )
+```
+
+
+```{python}
+def betweenness_plot(G, cb, cb_e, title):
+    """Plot graph with edge widths proportional to edge betweenness."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    pos = nx.kamada_kawai_layout(G, weight=None)
+    nx.draw_networkx_nodes(
+        G, pos=pos, ax=ax,
+        node_color=[G.nodes[n]["partition"] for n in G.nodes],
+        # linewidths=2,
+        node_size=[v * 1000 + 10 for v in cb.values()],
+    )
+    e_col = nx.draw_networkx_edges(
+        G, pos=pos, ax=ax,
+        edge_color=[cb_e[(u, v)] for u, v in G.edges(keys=False)],
+        edge_cmap=plt.cm.Blues,
+        # alpha=0.8,
+        # width=[v * 10 for v in cb_e.values()],
+        connectionstyle="arc3,rad=0.1",
+    )
+    for col in e_col:
+        col.set_zorder(2)
+    # Add title
+    ax.set_title(title)
+    plt.show()
+
+
+betweenness_plot(G, cb["Node"], cb["Edge"], "Betweenness centrality")
+betweenness_plot(G, cb_paths["Node"], cb_paths["Edge"],
+                 "Betweenness centrality given paths")
+betweenness_plot(G, cb_restr["Node"], cb_restr["Edge"],
+                 "Betweenness centrality restricted paths")
+```
+
+
+```{python}
+def _single_source_given_paths_simplified(dist_row):
+    """Sort nodes, predecessors and distances by distance.
+
+    Parameters
+    ----------
+    dist_row : np.array
+        Distance row sorted non-decreasingly.
+
+    Returns
+    -------
+    S : list
+        List of node indices in order of distance.
+
+    Notes
+    -----
+    Does not include endpoints.
+    """
+    dist_order = argsort(dist_row)
+    try:
+        # Remove unreachable indices (inf), check from back which is the first
+        # reachable node
+        while dist_row[dist_order[-1]] == np.inf:
+            dist_order = dist_order[:-1]
+        # Remove immediately reachable nodes with distance 0, including s itself
+        while dist_row[dist_order[0]] == 0:
+            dist_order = dist_order[1:]
+    except IndexError:
+        # If all nodes are unreachable, return empty list
+        return []
+    return list(dist_order)
+```
+
+
+```{python}
+def simplified_betweenness(node_order, edge_list, dist, pred):
+    """Simplified betweenness centrality calculation."""
+    node_indices = list(range(len(node_order)))
+    betweenness = dict.fromkeys(node_indices, 0.0)
+    betweenness_len = betweenness.copy()  # Length scaled betweenness
+    betweenness_lin = betweenness.copy()  # Linear scaled betweenness
+    betweenness_edge = betweenness.copy()
+    betweenness_edge.update(dict.fromkeys(
+        [(node_order.index(u), node_order.index(v)) for u, v in edge_list],
+        0.0))
+    betweenness_edge_len = betweenness_edge.copy()
+    betweenness_edge_lin = betweenness_edge.copy()
+    # b[v]=0 for v in G and b[e]=0 for e in G.edges
+    # Loop over nodes to collect betweenness using pair-wise dependencies
+    for s in node_indices:
+        S = _single_source_given_paths_simplified(dist[s])
+        # betweenness, _ = _accumulate_basic(betweenness, S.copy(), P, sigma, s)
+        # betweenness_edge = _accumulate_edges(betweenness_edge, S.copy(), P, sigma, s)
+        delta = dict.fromkeys(node_indices, 0)
+        delta_len = delta.copy()
+        # S is 1d-ndarray, while not empty
+        while S:
+            w = S.pop()
+            # No while loop over multiple predecessors, only one path per node pair
+            v = pred[s, w]  # P[w]
+            d = dist[s, w]  # D[w]
+            # Calculate dependency contribution
+            coeff = 1 + delta[w]
+            coeff_len = (1 / d + delta[w])
+            # Add edge betweenness contribution
+            if (v, w) not in betweenness_edge:
+                betweenness_edge[(w, v)] += coeff
+                betweenness_edge_len[(w, v)] += coeff_len
+                betweenness_edge_lin[(w, v)] += d * coeff_len
+            else:
+                betweenness_edge[(v, w)] += coeff
+                betweenness_edge_len[(v, w)] += coeff_len
+                betweenness_edge_lin[(v, w)] += d * coeff_len
+            # Add to dependency for further nodes/loops
+            delta[v] += coeff
+            delta_len[v] += coeff_len
+            # Add node betweenness contribution
+            if w != s:
+                betweenness[w] += delta[w]
+                betweenness_len[w] += delta_len[w]
+                betweenness_lin[w] += d * delta_len[w]
+    # Normalize betweenness values and rename node index keys to ids
+    scale = 1 / ((len(node_order) - 1) * (len(node_order) - 2))
+    for bc_dict in [betweenness, betweenness_len, betweenness_lin]:  # u_idx -> u_id
+        for v in bc_dict.keys():
+            bc_dict[v] *= scale
+            v = node_order[v]
+    for n in node_indices:  # Remove nodes
+        del betweenness_edge[n]
+        del betweenness_edge_len[n]
+        del betweenness_edge_lin[n]
+    scale = 1 / (len(node_order) * (len(node_order) - 1))
+    for bc_e_dict in [betweenness_edge, betweenness_edge_len,
+                      betweenness_edge_lin]:  # (u_idx, v_idx) -> (u_id, v_id)
+        for e in bc_e_dict.keys():
+            bc_e_dict[e] *= scale
+            e = (node_order[e[0]], node_order[e[1]])
+
+    return {
+        "Node": betweenness,
+        "Edge": betweenness_edge,
+        "Node_len": betweenness_len,
+        "Edge_len": betweenness_edge_len,
+        "Node_lin": betweenness_lin,
+        "Edge_lin": betweenness_edge_lin
+    }
+
+
+cb_paths_2 = simplified_betweenness(node_order, G.edges(keys=False), dist, pred)
+cb_restr_2 = simplified_betweenness(node_order, G.edges(keys=False), dist_restr,
+                                    pred_restr)
+```
+
+```{python}
+# Check if betweenness centrality is stored as edge attributes in G
+print("Checking edge attributes in graph G:")
+print()
+
+# Get first edge with all its attributes
+for u, v, k, data in G.edges(keys=True, data=True):
+    print(f"Edge {u}→{v} (key={k}): {data}")
+    break  # Just show first edge
+
+print()
+print("Available edge attributes:")
+sample_edge = list(G.edges(keys=True, data=True))[0]
+print(sample_edge[3].keys())
+```
+
+
+```{python}
+# Compare simplified vs standard betweenness for nodes
+import pandas as pd
+
+# Node comparison
+node_comparison = pd.DataFrame({
+    'Standard': cb['Node'],
+    'Simplified': cb_paths_2['Node'],
+})
+node_comparison['Difference'] = node_comparison['Simplified'] - node_comparison['Standard']
+node_comparison['Abs_Diff'] = abs(node_comparison['Difference'])
+node_comparison = node_comparison.sort_values('Abs_Diff', ascending=False)
+
+print("Node Betweenness Comparison:")
+print(node_comparison)
+print(f"\nMax difference: {node_comparison['Abs_Diff'].max():.4f}")
+print(f"Mean absolute difference: {node_comparison['Abs_Diff'].mean():.4f}")
+
+# Correlation
+correlation_nodes = node_comparison['Standard'].corr(node_comparison['Simplified'])
+print(f"Correlation: {correlation_nodes:.4f}")
+
+# Edge comparison
+edge_comparison = pd.DataFrame({
+    'Standard': pd.Series(cb['Edge']),
+    'Simplified': pd.Series(cb_paths_2['Edge']),
+})
+edge_comparison['Difference'] = edge_comparison['Simplified'] - edge_comparison['Standard']
+edge_comparison['Abs_Diff'] = abs(edge_comparison['Difference'])
+edge_comparison = edge_comparison.sort_values('Abs_Diff', ascending=False)
+
+print("\n\nEdge Betweenness Comparison:")
+print(edge_comparison.head(10))
+print(f"\nMax difference: {edge_comparison['Abs_Diff'].max():.4f}")
+print(f"Mean absolute difference: {edge_comparison['Abs_Diff'].mean():.4f}")
+
+# Correlation
+correlation_edges = edge_comparison['Standard'].corr(edge_comparison['Simplified'])
+print(f"Correlation: {correlation_edges:.4f}")
+
+# Visualization
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Scatter plot for nodes
+axes[0].scatter(node_comparison['Standard'], node_comparison['Simplified'], alpha=0.6)
+axes[0].plot([0, max(node_comparison['Standard'].max(), node_comparison['Simplified'].max())],
+             [0, max(node_comparison['Standard'].max(), node_comparison['Simplified'].max())], 
+             'r--', label='Perfect match')
+axes[0].set_xlabel('Standard Betweenness')
+axes[0].set_ylabel('Simplified Betweenness')
+axes[0].set_title(f'Node Betweenness Comparison (r={correlation_nodes:.3f})')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Scatter plot for edges
+axes[1].scatter(edge_comparison['Standard'], edge_comparison['Simplified'], alpha=0.6)
+axes[1].plot([0, max(edge_comparison['Standard'].max(), edge_comparison['Simplified'].max())],
+             [0, max(edge_comparison['Standard'].max(), edge_comparison['Simplified'].max())], 
+             'r--', label='Perfect match')
+axes[1].set_xlabel('Standard Betweenness')
+axes[1].set_ylabel('Simplified Betweenness')
+axes[1].set_title(f'Edge Betweenness Comparison (r={correlation_edges:.3f})')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+
+
+```{python}
+# Isolate contribution of single path: 17 -> 10
+source = 17
+target = 10
+
+# Find shortest path from 17 to 10
+path = nx.shortest_path(G, source=source, target=target, weight='weight')
+path_length = nx.shortest_path_length(G, source=source, target=target, weight='weight')
+
+print(f"Shortest path from {source} to {target}: {' -> '.join(map(str, path))}")
+print(f"Path length: {path_length}")
+print()
+
+# Manually trace the betweenness calculation for this path
+print("=" * 60)
+print(f"TRACING BETWEENNESS CONTRIBUTION FOR PATH {source} → {target}")
+print("=" * 60)
+print()
+
+# Get distance and predecessor info for source node
+s_idx = node_order.index(source)
+d_from_source = dist[s_idx]
+pred_from_source = pred[s_idx]
+
+# Process nodes in reverse order (farthest first)
+print(f"Processing nodes in reverse distance order from node {source}:")
+print()
+
+# Build delta accumulation table
+trace_data = []
+
+# Start with target node and work backward
+delta_values = {node: 0 for node in G.nodes()}
+
+for node in reversed(path[1:]):  # Skip source, process in reverse
+    node_idx = node_order.index(node)
+    distance_to_node = d_from_source[node_idx]
+    
+    # Find predecessor in the path
+    pred_idx = pred_from_source[node_idx]
+    pred_node = node_order[pred_idx] if pred_idx != -9999 else None
+    
+    # Calculate coefficients (without sigma division since sigma=1 for unique paths)
+    coeff_standard = 1 + delta_values[node]
+    coeff_len = (1 / distance_to_node) + delta_values[node] if distance_to_node != 0 else 0
+    coeff_lin = distance_to_node * coeff_len
+    
+    trace_data.append({
+        'Node': node,
+        'Distance': distance_to_node,
+        'Predecessor': pred_node,
+        'Delta_before': delta_values[node],
+        'Coeff_standard': coeff_standard,
+        'Coeff_len': coeff_len,
+        'Coeff_lin': coeff_lin,
+    })
+    
+    # Propagate delta to predecessor
+    if pred_node is not None:
+        delta_values[pred_node] += coeff_standard
+
+trace_df = pd.DataFrame(trace_data)
+print("Step-by-step delta accumulation:")
+print(trace_df.to_string(index=False))
+print()
+
+# Visualize the path on the graph
+fig, ax = plt.subplots(figsize=(10, 8))
+pos = nx.kamada_kawai_layout(G, weight=None)
+
+# Draw all nodes
+node_colors = []
+for node in G.nodes():
+    if node == source:
+        node_colors.append('gold')
+    elif node == target:
+        node_colors.append('crimson')
+    elif node in path:
+        node_colors.append('lightgreen')
+    else:
+        node_colors.append(G.nodes[node]['partition'])
+
+nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=500, ax=ax)
+nx.draw_networkx_labels(G, pos, font_size=10, ax=ax)
+
+# Draw all edges in light gray
+nx.draw_networkx_edges(G, pos, edge_color='lightgray', width=1, ax=ax, connectionstyle="arc3,rad=0.1")
+
+# Highlight path edges in red
+path_edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
+nx.draw_networkx_edges(G, pos, edgelist=path_edges, edge_color='red', width=3, ax=ax, connectionstyle="arc3,rad=0.1")
+
+# Add edge labels for path edges
+edge_labels = {}
+for u, v in path_edges:
+    # Get the weight of the edge
+    edge_data = G[u][v]
+    if isinstance(edge_data, dict):  # Single edge
+        weight = edge_data.get('weight', 1)
+    else:  # MultiDiGraph - edge_data is a dict of keys
+        weight = edge_data[0].get('weight', 1)
+    edge_labels[(u, v)] = f'{weight:.2f}'
+
+nx.draw_networkx_edge_labels(G, pos, edge_labels, font_size=10, font_color='red', ax=ax)
+
+ax.set_title(f'Shortest path from {source} to {target} (length={path_length:.2f})')
+ax.axis('off')
+plt.tight_layout()
+plt.show()
+
+print()
+print("=" * 60)
+print("INTERPRETATION:")
+print("=" * 60)
+print(f"1. DISTANCE (D): How far each node is from source {source}")
+print(f"   - Nodes farther away have smaller 1/D weights")
+print()
+print(f"2. DELTA ACCUMULATION: How dependency flows backward through path")
+print(f"   - Starts at 1 for target node")
+print(f"   - Each node adds its dependency to predecessors")
+print()
+print(f"3. COEFFICIENTS:")
+print(f"   - Standard (coeff): Simple 1 + delta accumulation")
+print(f"   - Length-scaled (coeff_len): (1/distance) + delta (farther = less weight)")
+print(f"   - Linear-scaled (coeff_lin): distance × coeff_len (distance weighted)")
+```
+
+```{python}
+# Plot betweenness contribution for each edge in the path - three scaling methods as line plot
+fig, ax = plt.subplots(figsize=(12, 6))
+
+# Get contribution values from trace_data
+bc_standard = [row['Coeff_standard'] for _, row in trace_df.iterrows()]
+bc_len = [row['Coeff_len'] for _, row in trace_df.iterrows()]
+bc_lin = [row['Coeff_lin'] for _, row in trace_df.iterrows()]
+edge_labels_list = []
+edge_weights = []
+
+# Calculate cumulative distances along the path
+cumulative_distances = [0]  # Start at source
+for u, v in path_edges:
+    edge_data = G[u][v]
+    if isinstance(edge_data, dict):
+        weight = edge_data.get('weight', 1)
+    else:
+        weight = edge_data[0].get('weight', 1)
+    cumulative_distances.append(cumulative_distances[-1] + weight)
+    edge_weights.append(weight)
+    edge_labels_list.append(f"{u}→{v}")
+
+# Use cumulative distance as x positions
+x_pos = cumulative_distances[1:]  # Position at the end of each edge
+
+# Plot lines for each scaling method
+ax.plot(cumulative_distances, [0] + bc_standard, marker='o', linewidth=2.5, markersize=8, 
+        color='steelblue', label='Standard Contribution')
+ax.plot(cumulative_distances, [0] + bc_len, marker='s', linewidth=2.5, markersize=8, 
+        color='orange', label='Length-Scaled Contribution')
+ax.plot(cumulative_distances, [0] + bc_lin, marker='^', linewidth=2.5, markersize=8, 
+        color='green', label='Linear-Scaled Contribution')
+
+# Add value labels on points
+for i, (s, l, lin) in enumerate(zip(bc_standard, bc_len, bc_lin)):
+    dist_pos = x_pos[i]
+    ax.text(dist_pos, s, f'{s:.3f}', ha='center', va='bottom', fontsize=8, color='steelblue')
+    ax.text(dist_pos, l, f'{l:.3f}', ha='center', va='bottom', fontsize=8, color='orange')
+    ax.text(dist_pos, lin, f'{lin:.3f}', ha='center', va='bottom', fontsize=8, color='green')
+
+# Annotate each edge with its weight
+y_min = min(min(bc_standard), min(bc_len), min(bc_lin)) * 0.5
+for i, weight in enumerate(edge_weights):
+    mid_x = (cumulative_distances[i] + cumulative_distances[i+1]) / 2
+    ax.text(mid_x, y_min, f'{weight:.2f}', ha='center', va='top', fontsize=10, 
+            style='italic', bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.3))
+
+ax.set_xlabel('Cumulative Distance', fontsize=12)
+ax.set_ylabel('Contribution Value', fontsize=12)
+ax.set_title(f'Path {source} → {target}: Contribution to Betweenness Centrality', fontsize=14)
+ax.set_xticks(cumulative_distances)
+ax.set_xticklabels(['Start'] + edge_labels_list, rotation=45, ha='right')
+ax.legend(loc='best', fontsize=11)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Print summary table
+print("\nPath Contribution Values:")
+path_contrib_df = pd.DataFrame({
+    'Edge': edge_labels_list,
+    'Weight': edge_weights,
+    'Cumulative Distance': x_pos,
+    'Standard': bc_standard,
+    'Length-Scaled': bc_len,
+    'Linear-Scaled': bc_lin
+})
+print(path_contrib_df.to_string(index=False))
+```
+
+
+```{python}
+from superblockify.metrics.measures import betweenness_centrality
+from superblockify.metrics.distances import calculate_path_distance_matrix
+```
+
+```{python}
+from superblockify import ResidentialPartitioner
+from superblockify.config import Config
+
+CITY_NAME, SEARCH_STR = Config.PLACES_SMALL[1]
+part = ResidentialPartitioner(
+    name=CITY_NAME + "_main", city_name=CITY_NAME, search_str=SEARCH_STR, unit="time"
+)
+part.run(calculate_metrics=False)
+
+# Intended use usually only with `run` method
+# or `calculate_metrics_before` partitioning
+node_list = part.get_sorted_node_list()
+```
+
+```{python}
+matrix, predecessors = calculate_path_distance_matrix(G, weight = "weight", node_order = node_order)
+```
+
+```{python}
+betweenness_centrality(G, node_order, matrix, predecessors, weight="weight")
+```
+
+
+```{python}
+
+```
