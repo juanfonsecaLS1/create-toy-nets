@@ -1,0 +1,194 @@
+---
+title: "Testing Betweenness Centrality on Toy Graphs"
+format: html
+---
+
+```{python}
+import sys
+sys.path.insert(0, 'UrbanToyGraph')
+import utg
+sys.path.insert(0, 'spatial-centrality-pub/algo')
+import centrality as sbc
+import net_helper as nh
+import pandas as pd
+
+from matplotlib.pyplot import plot
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.colors import TwoSlopeNorm
+import os
+import numpy as np
+import networkx as nx
+import osmnx as ox
+import matplotlib.pyplot as plt
+import momepy as mp
+
+# from superblockify.metrics.measures import betweenness_centrality as sb_betweenness_centrality
+# from superblockify.metrics.distances import calculate_path_distance_matrix as sb_calculate_path_distance_matrix
+```
+
+Defining a function to compute node weights based on the areas of the tessellation cells associated with each edge. The weight for each node is calculated as the sum of half the area of the tessellation cells for edges that are connected to that node (both incoming and outgoing).
+
+```{python}
+
+def compute_node_weights(edges_df, tessellation_df):
+    # Join edges with tessellation areas
+    tmp = edges_df[['u', 'v', 'geometry']].copy()
+    tmp['area'] = tessellation_df.geometry.area
+    
+    # Split edge weight to end nodes
+    wa = tmp.groupby('u')[['area']].sum() / 2
+    wa.index.name = 'node_id'
+    wb = tmp.groupby('v')[['area']].sum() / 2
+    wb.index.name = 'node_id'
+    
+    # Combine weights for each node
+    w = wa.join(wb, lsuffix='_from', rsuffix='_to', how='outer')
+    w.fillna(0, inplace=True)
+    w['weight'] = w['area_from'] + w['area_to']
+    
+    return w
+```
+
+A for loot to iterate over the toy graphs and compute different versions of the betweenness centrality:
+
+- Standard betweenness centrality using NetworkX's implementation.
+- Spatial betweenness centrality using the custom implementation as defined in the `spatial-centrality-pub` repository by Christian Werner (taken from https://github.com/christian-werner/spatial-centrality-pub).
+- Simplified betweenness centrality using the `superblockify` library, which assumes a single shortest path between node pairs.
+- Length scaled betweenness centrality using the same algorithm as the simplified version but appliying a scaling factor based on the lenght of the shortest path. 
+
+Graphical comparisons are saved in the plots directory of this respository.
+
+```{python}
+graph_files = [f for f in os.listdir('UrbanToyGraph/demo/template_graph') if f.endswith('.graphml')]
+```
+
+```{python}
+for graph_file in graph_files:
+    graph = utg.load_graph(os.path.join('UrbanToyGraph/demo/template_graph',graph_file))
+    graph_osmnx = utg.make_osmnx_compatible(graph).to_undirected()
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(graph_osmnx)
+
+    edges_gdf = edges_gdf.reset_index(drop=False).set_index('osmid')
+
+    envelope = nodes_gdf.union_all().convex_hull.envelope    
+    buffer = envelope.buffer(0.15*(envelope.area/np.pi)**0.5) # Buffering 15% of the equivalent radius of the envelope
+    tessellation_nodes = mp.morphological_tessellation(nodes_gdf,clip= buffer)
+    tessellation_nodes.index = nodes_gdf.index
+    tessellation_nodes['weight'] = tessellation_nodes.geometry.area
+
+    tessellation_edges = mp.morphological_tessellation(edges_gdf,clip= buffer,)
+    tessellation_edges.index = edges_gdf.index
+
+    node_weights = compute_node_weights(edges_gdf, tessellation_edges)
+
+    c_standard = nx.edge_betweenness_centrality(graph_osmnx, normalized=True, weight='length')
+
+    c_spatial_edges = sbc.spatial_betweenness_centrality(graph_osmnx, node_weights, node_weights, normalized=True, weight='length')
+    c_spatial_nodes = sbc.spatial_betweenness_centrality(graph_osmnx, tessellation_nodes, tessellation_nodes, normalized=True, weight='length')
+
+    node_order = list(range(len(graph_osmnx.nodes)))
+    # matrix, predecessors = sb_calculate_path_distance_matrix(graph_osmnx, weight = "length", node_order = node_order)
+    # sb_betweenness_centrality(graph_osmnx, node_order, matrix, predecessors, weight="length")
+
+    tdf = pd.DataFrame({
+    'u': [u for u, v, k in graph_osmnx.edges(keys=True)],
+    'v': [v for u, v, k in graph_osmnx.edges(keys=True)],
+    'key': [k for u, v, k in graph_osmnx.edges(keys=True)],
+    'edge_betweenness_normal': [data.get('edge_betweenness_normal', 0) for u, v, k, data in graph_osmnx.edges(keys=True, data=True)],
+    'edge_betweenness_length': [data.get('edge_betweenness_length', 0) for u, v, k, data in graph_osmnx.edges(keys=True, data=True)],
+    'edge_betweenness_linear': [data.get('edge_betweenness_linear', 0) for u, v, k, data in graph_osmnx.edges(keys=True, data=True)],
+    'c_standard': [c_standard.get((u, v, k), 0) for u, v, k in graph_osmnx.edges(keys=True)],
+    'c_spatial_edges': [c_spatial_edges.get((u, v, k), 0) for u, v, k in graph_osmnx.edges(keys=True)],
+    'c_spatial_nodes': [c_spatial_nodes.get((u, v, k), 0) for u, v, k in graph_osmnx.edges(keys=True)],
+    })
+
+    edges_with_centrality = edges_gdf.merge(
+    tdf, 
+    on=['u', 'v', 'key'], 
+    how='left'
+    )
+
+    # Create a directory to save the plots if it doesn't exist
+    if not os.path.exists('plots'):
+        os.makedirs('plots')
+
+
+    # Fill any NaN values with 0
+    edges_with_centrality['c_standard'] = edges_with_centrality['c_standard'].fillna(0)
+    edges_with_centrality['c_spatial_edges'] = edges_with_centrality['c_spatial_edges'].fillna(0)
+    edges_with_centrality['c_spatial_nodes'] = edges_with_centrality['c_spatial_nodes'].fillna(0)
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(list(edges_with_centrality['c_standard']), list(edges_with_centrality['c_spatial_edges']), alpha=0.5, color='purple')
+    plt.xlabel('Standard Betweenness Centrality')
+    plt.ylabel('Spatial Betweenness Centrality')
+    plt.title('Comparison of Standard BC vs Spatial BC')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # An arrangement of 4 plots 2 x 2, the top row with the standard and spatial BC plots of the graph, and the bottom row with the scatter plot comparing the two measures and map with the spatial - standard BC.
+    fig, axs = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # Get common color scale for both BC plots
+    vmin = min(edges_with_centrality['c_standard'].min(), edges_with_centrality['c_spatial_edges'].min())
+    vmax = max(edges_with_centrality['c_standard'].max(), edges_with_centrality['c_spatial_edges'].max())
+    
+    edges_with_centrality.plot(column='c_standard', ax=axs[0, 0], legend=True, cmap='viridis', vmin=vmin, vmax=vmax)
+    axs[0, 0].set_title('Standard Betweenness Centrality')
+    edges_with_centrality.plot(column='c_spatial_edges', ax=axs[0, 1], legend=True, cmap='viridis', vmin=vmin, vmax=vmax)
+    axs[0, 1].set_title('Spatial Edges Betweenness Centrality')
+    edges_with_centrality.plot(column='c_spatial_nodes', ax=axs[0, 2], legend=True, cmap='viridis', vmin=vmin, vmax=vmax)
+    axs[0, 2].set_title('Spatial Nodes Betweenness Centrality')
+    axs[1, 0].scatter(list(edges_with_centrality['c_standard']), list(edges_with_centrality['c_spatial_edges']), alpha=0.5, color='purple')
+    axs[1, 0].scatter(list(edges_with_centrality['c_standard']), list(edges_with_centrality['c_spatial_nodes']), alpha=0.5, color='yellow')
+    axs[1, 0].set_xlabel('Standard Betweenness Centrality')
+    axs[1, 0].set_ylabel('Spatial Edges Betweenness Centrality')
+    axs[1, 0].set_title('Comparison of Standard BC vs Spatial BC')
+    axs[1, 0].grid(True)
+    edges_with_centrality['c_diff'] = edges_with_centrality['c_spatial_edges'] - edges_with_centrality['c_standard']
+    edges_with_centrality['c_diff_n'] = edges_with_centrality['c_spatial_nodes'] - edges_with_centrality['c_standard']
+    
+    # Plot tessellation with alpha based on area
+    areas_edges = tessellation_edges.geometry.area
+    areas_normalized_edges = (areas_edges - areas_edges.min()) / (areas_edges.max() - areas_edges.min())
+    
+    areas_nodes = tessellation_nodes.geometry.area
+    areas_normalized_nodes = (areas_nodes - areas_nodes.min()) / (areas_nodes.max() - areas_nodes.min())
+    
+    for idx, row in tessellation_edges.iterrows():
+        if row.geometry.geom_type == 'Polygon':
+            x, y = row.geometry.exterior.xy
+            alpha = 0.2 + 0.6 * areas_normalized_edges[idx]
+            poly = MplPolygon(list(zip(x, y)), alpha=alpha, facecolor='gray', edgecolor='white', linewidth=0.1)
+            axs[1, 1].add_patch(poly)
+    
+    # Plot edges with difference centrality
+    vmin_diff = min(edges_with_centrality['c_diff'].min(), edges_with_centrality['c_diff_n'].min())
+    vmax_diff = max(edges_with_centrality['c_diff'].max(), edges_with_centrality['c_diff_n'].max())
+    
+    norm = TwoSlopeNorm(vcenter=0, vmin=vmin_diff, vmax=vmax_diff)
+    
+    edges_with_centrality.plot(column='c_diff', ax=axs[1, 1], legend=True, cmap='coolwarm', norm=norm)
+    axs[1, 1].set_title('Difference (Spatial Edges BC - Standard BC)')
+    
+    for idx, row in tessellation_nodes.iterrows():
+        if row.geometry.geom_type == 'Polygon':
+            x, y = row.geometry.exterior.xy
+            alpha = 0.2 + 0.6 * areas_normalized_nodes[idx]
+            poly = MplPolygon(list(zip(x, y)), alpha=alpha, facecolor='gray', edgecolor='white', linewidth=0.1)
+            axs[1, 2].add_patch(poly)
+    
+    # Plot edges with difference centrality
+    edges_with_centrality.plot(column='c_diff_n', ax=axs[1, 2], legend=True, cmap='coolwarm', norm=norm)
+    axs[1, 2].set_title('Difference (Spatial Nodes BC - Standard BC)')
+    
+    fig.suptitle(f'Toy Graph: {graph_file}', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    # Save the plot as PNG
+    filename = f"plots/{graph_file.replace('.graphml', '')}_bc_comparison_edges_vs_nodes.png"
+    plt.savefig(filename, dpi=330, bbox_inches='tight')
+    # plt.show()
+```
+
