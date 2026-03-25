@@ -213,3 +213,6 @@ __marimo__/
 # superblockify folders
 cache/*
 data/*
+
+# city graphs data
+graphs/*
