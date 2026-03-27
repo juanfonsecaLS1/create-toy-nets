@@ -1,6 +1,9 @@
 ---
-title: "Untitled"
-format: html
+title: "Exploring the implementation of betweenness centrality with Superblockify"
+format:
+  html:
+    embed-resources: true
+    
 ---
 
 Computing BC with the Superblockify.
@@ -20,6 +23,7 @@ from superblockify.metrics.distances import shortest_paths_restricted
 from numpy import argsort
 ```
 
+Using the same example as in the documentation
 
 ```{python}
 # Create planar graph, similar to a street network
@@ -528,24 +532,12 @@ target = 10
 path = nx.shortest_path(G, source=source, target=target, weight='weight')
 path_length = nx.shortest_path_length(G, source=source, target=target, weight='weight')
 
-print(f"Shortest path from {source} to {target}: {' -> '.join(map(str, path))}")
-print(f"Path length: {path_length}")
-print()
-
-# Manually trace the betweenness calculation for this path
-print("=" * 60)
-print(f"TRACING BETWEENNESS CONTRIBUTION FOR PATH {source} → {target}")
-print("=" * 60)
-print()
 
 # Get distance and predecessor info for source node
 s_idx = node_order.index(source)
 d_from_source = dist[s_idx]
 pred_from_source = pred[s_idx]
 
-# Process nodes in reverse order (farthest first)
-print(f"Processing nodes in reverse distance order from node {source}:")
-print()
 
 # Build delta accumulation table
 trace_data = []
@@ -629,25 +621,12 @@ ax.axis('off')
 plt.tight_layout()
 plt.show()
 
-print()
-print("=" * 60)
-print("INTERPRETATION:")
-print("=" * 60)
-print(f"1. DISTANCE (D): How far each node is from source {source}")
-print(f"   - Nodes farther away have smaller 1/D weights")
-print()
-print(f"2. DELTA ACCUMULATION: How dependency flows backward through path")
-print(f"   - Starts at 1 for target node")
-print(f"   - Each node adds its dependency to predecessors")
-print()
-print(f"3. COEFFICIENTS:")
-print(f"   - Standard (coeff): Simple 1 + delta accumulation")
-print(f"   - Length-scaled (coeff_len): (1/distance) + delta (farther = less weight)")
-print(f"   - Linear-scaled (coeff_lin): distance × coeff_len (distance weighted)")
 ```
 
+Comparing the three scaling methods.
+
+
 ```{python}
-# Plot betweenness contribution for each edge in the path - three scaling methods as line plot
 fig, ax = plt.subplots(figsize=(12, 6))
 
 # Get contribution values from trace_data
@@ -717,23 +696,3 @@ path_contrib_df = pd.DataFrame({
 print(path_contrib_df.to_string(index=False))
 ```
 
-
-```{python}
-from superblockify.metrics.measures import betweenness_centrality
-from superblockify.metrics.distances import calculate_path_distance_matrix
-```
-
-```{python}
-matrix, predecessors = calculate_path_distance_matrix(G, weight = "weight", node_order = node_order)
-```
-
-```{python}
-betweenness_centrality(G, node_order, matrix, predecessors, weight="weight")
-```
-
-
-```{python}
- 
-    
-
-```
